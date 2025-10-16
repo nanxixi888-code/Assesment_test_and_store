@@ -49,6 +49,7 @@ def main():
     # Initialize data storage
     tau_mes_all = []
     regressor_all = []
+    last_print_time = -1  # <<< 新增：用于每1s打印
 
     # Data collection loop
     while current_time < max_time:
@@ -81,13 +82,15 @@ def main():
 
         
         # TODO Compute regressor and store it
-        Y_t = dyn_model.ComputeDynamicRegressor(q_mes, qd_mes, qdd_mes)     # (7, 70)
+        Y_t = dyn_model.ComputeDynamicRegressor(q_mes, qd_mes, qdd_mes)  # (7, 70)
         regressor_all.append(Y_t)
         tau_mes_all.append(np.asarray(tau_mes))
         
         current_time += time_step
-        # Optional: print current time
-        print(f"Current time in seconds: {current_time:.2f}")
+        # Optional: print current time  —— 改成每1秒输出一次
+        if int(current_time) != int(last_print_time):
+            print(f"Sim time = {int(current_time)} s")
+            last_print_time = int(current_time)
 
     # TODO After data collection, stack all the regressor and all the torque and compute the parameters 'a'  using pseudoinverse for all the joint
     if len(regressor_all) == 0:
@@ -102,34 +105,38 @@ def main():
     print("\n[Part2] estimated full parameter vector (len={}): ridge λ={}".format(a_hat_all.size, lam_all))
 
     # TODO reshape the regressor and the torque vector to isolate the last joint and find the its dynamical parameters
-    # 用 “1–6 已知” 的残差法，仅估计 link7 的 10 个参数
+    # —— 用“1..6 已知”法，仅估计 link7 的10参，并与真值对比 + 误差统计
     urdf_path = os.path.join(cur_dir, "models", "panda_description", "panda.urdf")
     link_names = [f"panda_link{i}" for i in range(1,8)]
     per_link_params_known = {i: extract_link10_from_urdf(urdf_path, link_names[i-1]) for i in range(1,7)}
     a_known_full = build_full_param_vector(7, per_link_params_known)
 
     s7, e7 = 10*(7-1), 10*(7-1)+10
-    r = u - (Y @ a_known_full)           # 去掉 1..6 链节贡献
-    X7 = Y[:, s7:e7]                     # 只取 link7 的 10 列
+    r = u - (Y @ a_known_full)     # 去掉 1..6 链节贡献
+    X7 = Y[:, s7:e7]               # 只取 link7 的 10 列
     lam7 = 1e-6 if np.linalg.cond(X7.T @ X7) < 1e6 else 1e-4
     a7_hat = np.linalg.solve(X7.T @ X7 + lam7*np.eye(10), X7.T @ r)
 
     a7_true = extract_link10_from_urdf(urdf_path, link_names[6])
-    print("\n[Part1] link7 params:")
+    abs_err = np.abs(a7_hat - a7_true)
+    rel_err = np.where(a7_true != 0, 100*np.abs((a7_hat - a7_true)/a7_true), np.nan)
+    print("\n[Part1] link7 params (hat vs true):")
     print("  a7_hat :", np.round(a7_hat, 6))
     print("  a7_true:", np.round(a7_true, 6))
-    print("  abs err:", np.round(np.abs(a7_hat - a7_true), 6))
+    print("  abs err:", np.round(abs_err, 6))
+    print("  rel %  :", np.round(rel_err, 2))
+    print(f"  mean rel err = {np.nanmean(rel_err):.2f}%   max rel err = {np.nanmax(rel_err):.2f}%")
 
     # TODO compute the metrics (R-squared adjusted etc...) for the linear model on a different file 
-    # 这里先在当前数据上给出指标（若要严格分训练/验证，可把这段复制到另一个评估脚本中）
+    # —— 在当前数据上先给出指标 + 扭矩 RMSE
     a_full_hat = a_known_full.copy(); a_full_hat[s7:e7] = a7_hat
     u_pred_part1 = Y @ a_full_hat
     mets1 = regression_metrics(u, u_pred_part1, p=10, has_intercept=False)
-    print("\n[Part1] metrics:", mets1)
-
-    u_pred_part2 = Y @ a_hat_all
-    mets2 = regression_metrics(u, u_pred_part2, p=Y.shape[1], has_intercept=False)
-    print("[Part2] metrics:", mets2)
+    rmse = np.sqrt(np.mean((u_pred_part1 - u)**2))
+    print("\n[Part1] metrics & torque error:")
+    print(f"  RMSE: {rmse:.6f} N·m")
+    for k, v in mets1.items():
+        print(f"  {k}: {v:.6f}")
     
     # TODO plot the torque prediction error for each joint (optional)
     T = len(tau_mes_all)
@@ -154,6 +161,87 @@ def main():
     plt.savefig("part1_torque.png", dpi=150)
     print("[OK] saved plot -> part1_torque.png")
 
+        # =========================
+    # === PART 2: ALL LINKS (70 params) – print, compare, plot
+    # =========================
+    print("\n" + "="*72)
+    print("PART 2: All 7 links unknown — full 70-parameter comparison & metrics")
+    print("="*72)
+
+    # 1) Ensure we have Y (T*7 x 70), u (T*7,), and a_hat_all
+    #    (If you already computed a_hat_all above, this will reuse it.)
+    Y_all = Y
+    u_all = u
+    if 'a_hat_all' not in locals():
+        XtX_all = Y_all.T @ Y_all
+        lam_all = 1e-6 if np.linalg.cond(XtX_all) < 1e6 else 1e-4
+        a_hat_all = np.linalg.solve(XtX_all + lam_all*np.eye(XtX_all.shape[0]), Y_all.T @ u_all)
+        print(f"[diag] computed a_hat_all with ridge λ={lam_all}")
+
+    # 2) Build "true" parameters for all 7 links from URDF
+    urdf_path = os.path.join(cur_dir, "models", "panda_description", "panda.urdf")
+    link_names = [f"panda_link{i}" for i in range(1,8)]
+    true_params_all = {i: extract_link10_from_urdf(urdf_path, link_names[i-1]) for i in range(1,8)}
+    a_true_all = build_full_param_vector(7, true_params_all)
+
+    # 3) Compare per link (print abs / rel%) and collect per-link mean relative error
+    abs_err_all = np.abs(a_hat_all - a_true_all)
+    rel_err_all = np.where(a_true_all != 0, 100*np.abs((a_hat_all - a_true_all)/a_true_all), np.nan)
+
+    print("\nPer-link parameter errors (abs & rel %):")
+    per_link_mean_rel = []
+    for i in range(1, 8):
+        s, e = 10*(i-1), 10*i
+        abs_i = abs_err_all[s:e]
+        rel_i = rel_err_all[s:e]
+        per_link_mean_rel.append(np.nanmean(rel_i))
+        print(f"\nLink {i}:")
+        print("  abs err:", np.round(abs_i, 6))
+        print("  rel %  :", np.round(rel_i, 2))
+        print(f"  mean |rel| = {np.nanmean(rel_i):.2f}%   max |rel| = {np.nanmax(rel_i):.2f}%")
+
+    # 4) Overall metrics for full model (torque fit)
+    u_pred_all = Y_all @ a_hat_all
+    rmse_all = np.sqrt(np.mean((u_pred_all - u_all)**2))
+    mets_all = regression_metrics(u_all, u_pred_all, p=Y_all.shape[1], has_intercept=False)
+    print("\n[Part 2] Torque-fit metrics:")
+    print(f"  RMSE: {rmse_all:.6f} N·m")
+    for k, v in mets_all.items():
+        print(f"  {k}: {v:.6f}")
+
+    # 5) Plot mean relative error per link (7 bars)
+    fig2, ax2 = plt.subplots(figsize=(8,4))
+    ax2.bar(np.arange(1,8), per_link_mean_rel)
+    ax2.set_xlabel("Link index")
+    ax2.set_ylabel("Mean relative error (%)")
+    ax2.set_title("Part 2: Mean relative parameter error per link")
+    ax2.set_xticks(np.arange(1,8))
+    ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("part2_link_mean_rel_errors.png", dpi=150)
+    print("[OK] saved plot → part2_link_mean_rel_errors.png")
+
+    # (Optional) plot torque prediction vs measured for the full 70-param model (overlay)
+    tau_pred_full_mat = np.vstack([Yt @ a_hat_all for Yt in regressor_all])   # (T, 7)
+    tau_true_mat = np.vstack(tau_mes_all)                                     # (T, 7)
+    t_axis2 = np.arange(tau_true_mat.shape[0]) * time_step
+
+    fig3, axes3 = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
+    for j in range(7):
+        ax = axes3[j]
+        ax.plot(t_axis2, tau_true_mat[:, j], label=f"τ{j+1} meas")
+        ax.plot(t_axis2, tau_pred_full_mat[:, j], "--", label=f"τ{j+1} pred (full)")
+        ax.set_ylabel(f"J{j+1}")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend(loc="upper right", ncol=2, fontsize=8)
+    axes3[-1].set_xlabel("Time [s]")
+    fig3.suptitle("Part 2: Torque prediction (all 70 params) vs measured")
+    plt.tight_layout()
+    plt.savefig("part2_torque.png", dpi=150)
+    print("[OK] saved plot → part2_torque.png")
+
+
 if __name__ == '__main__':
     main()
 
@@ -172,7 +260,7 @@ def regression_metrics(y, y_hat, p, has_intercept=False):
     num = (SSR / max(p,1))
     den = (RSS / df_resid)
     F = (num / den) if den > 0 else np.nan
-    return {"RSS": RSS, "TSS": TSS, "R2": R2, "R2_adj": R2_adj, "F": F, "M": M, "p": p}
+    return {"RSS": RSS, "TSS": TSS, "R2": R2, "R2_adj": R2_adj, "F": F}
 
 def rpy_to_R(roll, pitch, yaw):
     cr, sr = np.cos(roll), np.sin(roll)
@@ -185,7 +273,7 @@ def rpy_to_R(roll, pitch, yaw):
 
 def extract_link10_from_urdf(urdf_path, link_name):
     """Parse URDF and return [m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz] (in link frame)."""
-    import xml.etree.ElementTree as ET  # 局部导入，避免改动顶部 import
+    import xml.etree.ElementTree as ET
     tree = ET.parse(urdf_path)
     root = tree.getroot()
     link = None
@@ -217,5 +305,4 @@ def build_full_param_vector(n_dof, per_link_params):
     a_full = np.zeros(10*n_dof)
     for link_idx, a10 in per_link_params.items():
         s = 10*(link_idx-1); a_full[s:s+10] = np.asarray(a10).reshape(10,)
-        # 其余未提供的链节保持 0（按“已知 1..6；未知 7”的设定）
     return a_full
