@@ -1,363 +1,333 @@
 import numpy as np
-import os
 import time
-import math
-import sys
-import datetime
+import os
 import matplotlib
-matplotlib.use("Agg")  # 避免无显示环境下阻塞
+matplotlib.use("Agg")   # 非GUI环境安全输出
 import matplotlib.pyplot as plt
+from simulation_and_control import pb, MotorCommands, PinWrapper, feedback_lin_ctrl, SinusoidalReference 
 import xml.etree.ElementTree as ET
 
-from simulation_and_control import pb, MotorCommands, PinWrapper, feedback_lin_ctrl, SinusoidalReference
-
 # =========================
-# Utils
+# ===== Helper functions ==
 # =========================
 
-def makedirs(path):
-    os.makedirs(path, exist_ok=True)
-    return path
+def rpy_to_R(roll, pitch, yaw):
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    Rz = np.array([[cy, -sy, 0],[sy, cy, 0],[0, 0, 1]])
+    Ry = np.array([[cp, 0, sp],[0, 1, 0],[-sp, 0, cp]])
+    Rx = np.array([[1, 0, 0],[0, cr, -sr],[0, sr, cr]])
+    return Rz @ Ry @ Rx  # XYZ fixed-axis roll->pitch->yaw
 
-def now_tag():
-    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+def extract_link10_from_urdf(urdf_path, link_name):
+    """Return [m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz] in the LINK frame."""
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    link = None
+    for lk in root.findall('link'):
+        if lk.get('name') == link_name:
+            link = lk
+            break
+    if link is None:
+        raise ValueError(f"Link '{link_name}' not found in URDF.")
 
-def compute_metrics(y_true, y_pred, p):
-    """
-    返回: dict(rss, tss, r2, r2_adj, F, dof_num, dof_den)
-    p: 自变量维度 (参数个数)
-    """
-    y_true = np.asarray(y_true).ravel()
-    y_pred = np.asarray(y_pred).ravel()
-    rss = float(np.sum((y_true - y_pred) ** 2))
-    tss = float(np.sum((y_true - np.mean(y_true)) ** 2))
-    n = len(y_true)
-    r2 = 1.0 - rss / (tss + 1e-12)
-    dof_num = max(p, 1)
-    dof_den = max(n - p, 1)
-    # 经典线性回归 F 统计量（用于整体显著性检验）
-    F = ((tss - rss) / dof_num) / (rss / dof_den + 1e-12)
-    # Adjusted R^2
-    r2_adj = 1.0 - (1.0 - r2) * (n - 1) / max(n - p - 1, 1)
-    return dict(rss=rss, tss=tss, r2=r2, r2_adj=r2_adj, F=F, dof_num=dof_num, dof_den=dof_den)
+    inertial = link.find('inertial')
+    mass_tag = inertial.find('mass')
+    m = float(mass_tag.attrib['value'])
 
-def ci_from_ols(X, y, a_hat, ridge_lambda=0.0, alpha=0.05):
-    """
-    基于 (X^T X + λI)^(-1) 估计协方差并给出 (1-alpha) 置信区间（正态近似）。
-    """
-    X = np.asarray(X)
-    y = np.asarray(y).ravel()
-    n, p = X.shape
-    lamI = ridge_lambda * np.eye(p)
-    XtX = X.T @ X + lamI
-    # 残差方差
-    resid = y - X @ a_hat
-    dof = max(n - p, 1)
-    sigma2 = float(resid @ resid) / dof
-    cov = sigma2 * np.linalg.inv(XtX)
-    stderr = np.sqrt(np.clip(np.diag(cov), 0.0, np.inf))
-    # 1.96对应95%置信区间（大样本正态近似）
-    z = 1.96 if abs(alpha - 0.05) < 1e-12 else 1.96
-    lo = a_hat - z * stderr
-    hi = a_hat + z * stderr
-    return lo, hi, stderr, sigma2
+    origin = inertial.find('origin')
+    if origin is not None:
+        xyz = [float(v) for v in origin.attrib.get('xyz', '0 0 0').split()]
+        rpy = [float(v) for v in origin.attrib.get('rpy', '0 0 0').split()]
+    else:
+        xyz = [0.0, 0.0, 0.0]; rpy = [0.0, 0.0, 0.0]
+    cx, cy, cz = xyz
+    R_li = rpy_to_R(*rpy)
 
-def parse_urdf_link7_true_params(urdf_path, link_name_candidates=("panda_link7", "link7")):
-    """
-    尝试从 URDF 解析 link7 的真实参数，返回 a7_true: [m, mcx, mcy, mcz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz]
-    - 若 inertial.origin 有位姿，会把惯量张量从 inertia frame 旋转到 link frame（近似处理）。
-    - 如果无法解析，返回 None。
-    """
-    if not os.path.isfile(urdf_path):
-        return None
-    try:
-        tree = ET.parse(urdf_path)
-        root = tree.getroot()
-        ns = ""  # 有些URDF无命名空间
-        def find_link(root, names):
-            for link in root.findall(f"{ns}link"):
-                nm = link.get("name", "")
-                for cand in names:
-                    if cand in nm:
-                        return link
-            return None
+    I = inertial.find('inertia').attrib
+    I_in = np.array([[float(I['ixx']), float(I['ixy']), float(I['ixz'])],
+                     [float(I['ixy']), float(I['iyy']), float(I['iyz'])],
+                     [float(I['ixz']), float(I['iyz']), float(I['izz'])]])
+    I_link = R_li @ I_in @ R_li.T
+    Ixx, Ixy, Ixz = I_link[0,0], I_link[0,1], I_link[0,2]
+    Iyy, Iyz, Izz = I_link[1,1], I_link[1,2], I_link[2,2]
+    return np.array([m, m*cx, m*cy, m*cz, Ixx, Ixy, Ixz, Iyy, Iyz, Izz], dtype=float)
 
-        link = find_link(root, link_name_candidates)
-        if link is None:
-            return None
-        inertial = link.find(f"{ns}inertial")
-        if inertial is None:
-            return None
+def build_full_param_vector(n_dof, per_link_params):
+    a_full = np.zeros(10 * n_dof)
+    for link_idx, a10 in per_link_params.items():
+        s = 10*(link_idx-1); a_full[s:s+10] = np.asarray(a10).reshape(10,)
+    return a_full
 
-        mass_tag = inertial.find(f"{ns}mass")
-        inertia_tag = inertial.find(f"{ns}inertia")
-        origin_tag = inertial.find(f"{ns}origin")
-
-        m = float(mass_tag.get("value"))
-        # CoM 在 origin 的 xyz
-        com_xyz = np.array([0.0, 0.0, 0.0])
-        R = np.eye(3)
-        if origin_tag is not None:
-            if origin_tag.get("xyz"):
-                com_xyz = np.array(list(map(float, origin_tag.get("xyz").split())))
-            if origin_tag.get("rpy"):
-                rpy = list(map(float, origin_tag.get("rpy").split()))
-                roll, pitch, yaw = rpy
-                cr, sr = math.cos(roll), math.sin(roll)
-                cp, sp = math.cos(pitch), math.sin(pitch)
-                cy, sy = math.cos(yaw), math.sin(yaw)
-                Rz = np.array([[cy, -sy, 0],[sy, cy, 0],[0,0,1]])
-                Ry = np.array([[cp, 0, sp],[0,1,0],[-sp, 0, cp]])
-                Rx = np.array([[1,0,0],[0,cr,-sr],[0,sr,cr]])
-                R = Rz @ Ry @ Rx
-
-        Ixx = float(inertia_tag.get("ixx"))
-        Ixy = float(inertia_tag.get("ixy"))
-        Ixz = float(inertia_tag.get("ixz"))
-        Iyy = float(inertia_tag.get("iyy"))
-        Iyz = float(inertia_tag.get("iyz"))
-        Izz = float(inertia_tag.get("izz"))
-        I_in_inertia = np.array([[Ixx, Ixy, Ixz],
-                                 [Ixy, Iyy, Iyz],
-                                 [Ixz, Iyz, Izz]])
-        # 旋转到 link frame（近似：忽略并未提供的 link 固定位姿差异）
-        I_link = R @ I_in_inertia @ R.T
-
-        a7_true = np.array([
-            m, m*com_xyz[0], m*com_xyz[1], m*com_xyz[2],
-            I_link[0,0], I_link[0,1], I_link[0,2], I_link[1,1], I_link[1,2], I_link[2,2]
-        ])
-        return a7_true
-    except Exception:
-        return None
+def regression_metrics(y, y_hat, p, has_intercept=False):
+    """Return RSS, TSS, R2, R2_adj, F-stat with consistent DOF."""
+    M = y.size
+    residual = y - y_hat
+    RSS = float(residual @ residual)
+    TSS = float(((y - y.mean()) ** 2).sum()) if M > 0 else np.nan
+    R2 = 1.0 - (RSS / TSS if TSS > 0 else np.nan)
+    df_resid = max(M - p - (1 if has_intercept else 0), 1)
+    df_adj_den = max(M - (1 if has_intercept else 0), 1)
+    R2_adj = 1.0 - ((RSS / df_resid) / (TSS / df_adj_den) if TSS > 0 else np.nan)
+    SSR = max(TSS - RSS, 0.0)
+    num = (SSR / max(p,1))
+    den = (RSS / df_resid)
+    F = (num / den) if den > 0 else np.nan
+    return {"RSS": RSS, "TSS": TSS, "R2": R2, "R2_adj": R2_adj, "F": F, "M": M, "p": p}
 
 # =========================
-# Simulation + Identification
+# ========   MAIN   =======
 # =========================
 
-def run_sim(conf_file_name, cur_dir, amplitude, frequency, duration=10.0, kp=1000.0, kd=100.0, seed=42, phase=None):
-    """
-    单次仿真，返回:
-      Y_blocks: (T, n, 10n)  regressor
-      U_blocks: (T, n)       measured torques
-    """
-    rng = np.random.default_rng(seed)
-
+def main():
+    # --- 仿真初始化 ---
+    conf_file_name = "pandaconfig.json"
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
     sim = pb.SimInterface(conf_file_name, conf_file_path_ext=cur_dir)
+
+    # 关节、动力学模型
     ext_names = sim.getNameActiveJoints()
     ext_names = np.expand_dims(np.array(ext_names), axis=0)
     source_names = ["pybullet"]
     dyn_model = PinWrapper(conf_file_name, "pybullet", ext_names, source_names, False, 0, cur_dir)
-    n = dyn_model.getNumberofActuatedJoints()
+    num_joints = dyn_model.getNumberofActuatedJoints()
 
-    # 轨迹参考：若 SinusoidalReference 支持相位，用它；否则我们在 get_values 后手动加相位。
-    amplitude = np.asarray(amplitude).reshape(n)
-    frequency = np.asarray(frequency).reshape(n)
-    if phase is None:
-        phase = rng.uniform(0, 2*np.pi, size=n)
-    phase = np.asarray(phase).reshape(n)
+    print(f"Initial joint angles: {sim.GetInitMotorAngles()}")
 
-    ref = None
-    try:
-        # 有的实现已有相位参数，可尝试
-        ref = SinusoidalReference(amplitude, frequency, sim.GetInitMotorAngles(), phase=phase)
-        use_phase_in_class = True
-    except TypeError:
-        # 回退：类不支持相位，我们之后手动加
-        ref = SinusoidalReference(amplitude, frequency, sim.GetInitMotorAngles())
-        use_phase_in_class = False
+    # --- 正弦参考 ---
+    amplitudes = [np.pi/4, np.pi/6, np.pi/4, np.pi/4, np.pi/4, np.pi/4, np.pi/4]
+    frequencies = [0.4, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4]
+    amplitude = np.array(amplitudes)
+    frequency = np.array(frequencies)
+    ref = SinusoidalReference(amplitude, frequency, sim.GetInitMotorAngles())
 
+    # --- 仿真参数 ---
     time_step = sim.GetTimeStep()
     current_time = 0.0
-    max_time = float(duration)
-
+    max_time = 10.0
     cmd = MotorCommands()
-    regressor_all = []
-    tau_mes_all = []
+    kp = 1000
+    kd = 100
 
-    frames = 0
-    start = time.time()
+    # --- 数据缓存 ---
+    tau_mes_all = []      # list of (n,)
+    regressor_all = []    # list of (n, 10n)
+    times = []
+    last_print_sec = -1   # 每1s打印一次
 
+    # --- 主循环：采集 τ 与 Y ---
     while current_time < max_time:
         q_mes = sim.GetMotorAngles(0)
         qd_mes = sim.GetMotorVelocities(0)
         qdd_mes = sim.ComputeMotorAccelerationTMinusOne(0)
 
         q_d, qd_d = ref.get_values(current_time)
-        if not use_phase_in_class:
-            # 若类不支持相位： q_d(t) += A*sin(2π f t + φ) - A*sin(2π f t) 的差额（近似修正）
-            # 但为了不破坏类内部实现，我们简单地在目标位置上叠加一个相位偏移项
-            q_d = q_d + amplitude * (np.sin(2*np.pi*frequency*current_time + phase) - np.sin(2*np.pi*frequency*current_time))
-
         tau_cmd = feedback_lin_ctrl(dyn_model, q_mes, qd_mes, q_d, qd_d, kp, kd)
-        cmd.SetControlCmd(tau_cmd, ["torque"] * n)
+        cmd.SetControlCmd(tau_cmd, ["torque"]*7)
         sim.Step(cmd, "torque")
 
         tau_mes = sim.GetMotorTorques(0)
+        Y_t = dyn_model.ComputeDynamicRegressor(q_mes, qd_mes, qdd_mes)  # (7, 70)
 
-        try:
-            regressor = dyn_model.ComputeDynamicRegressor(q_mes, qd_mes, qdd_mes)  # (n, 10n)
-        except Exception as e:
-            raise RuntimeError(f"ComputeDynamicRegressor failed at t={current_time:.4f}: {e}")
+        regressor_all.append(Y_t)
+        tau_mes_all.append(np.asarray(tau_mes))
+        times.append(current_time)
 
-        regressor_all.append(np.array(regressor))
-        tau_mes_all.append(np.array(tau_mes).reshape(-1))
+        # 每 1s 打印一次
+        cur_sec = int(current_time)
+        if cur_sec != last_print_sec:
+            print(f"Sim time: {cur_sec}s")
+            last_print_sec = cur_sec
 
-        frames += 1
-        if frames % 200 == 0:
-            print(f"[run_sim] t={current_time:.2f}s, frames={frames}")
-
-        # 禁用键盘事件以免PDF换行导致静默
-        # keys = sim.GetPyBulletClient().getKeyboardEvents()
-        # qKey = ord('q')
-        # if qKey in keys and keys[qKey] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
-        #     break
+        # 退出键
+        keys = sim.GetPyBulletClient().getKeyboardEvents()
+        qKey = ord('q')
+        if qKey in keys and keys[qKey] and sim.GetPyBulletClient().KEY_WAS_TRIGGERED:
+            break
 
         current_time += time_step
 
-    dt = time.time() - start
-    print(f"[run_sim] finished: frames={frames}, duration={dt:.2f}s, avg_hz={frames/max(dt,1e-6):.1f}")
+    # --- 安全检查 ---
+    if len(regressor_all) == 0:
+        print("No data collected. Exiting.")
+        return
 
-    Y_blocks = np.stack(regressor_all, axis=0)  # (T, n, 10n)
-    U_blocks = np.stack(tau_mes_all, axis=0)    # (T, n)
-    return Y_blocks, U_blocks, n
+    # --- 去掉前 1s 预热样本 ---
+    N_warm = int(1.0 / time_step)
+    regressor_all = regressor_all[N_warm:]
+    tau_mes_all   = tau_mes_all[N_warm:]
+    times         = times[N_warm:]
 
-def stack_last_joint(Y_blocks, U_blocks):
-    """
-    取每个时间步“最后一个关节”的一行回归与扭矩：
-    返回 X: (T, 10), y: (T,)
-    """
-    T, n, ten_n = Y_blocks.shape
-    assert ten_n == 10*n, f"regressor width unexpected: {ten_n} vs 10*{n}"
-    X_list, y_list = [], []
-    for t in range(T):
-        Y_t = Y_blocks[t]         # (n, 10n)
-        U_t = U_blocks[t]         # (n,)
-        X_list.append(Y_t[-1, -10:])  # last joint, last 10 params
-        y_list.append(U_t[-1])
-    X = np.vstack(X_list)
-    y = np.array(y_list)
-    return X, y
+    n = num_joints
+    Y_stack = np.vstack(regressor_all)      # (T*n, 10n)
+    tau_stack = np.hstack(tau_mes_all)      # (T*n,)
 
-def estimate_a7(X, y, ridge_lambda=1e-8):
-    """
-    求解 a7_hat （10维），返回 (a7_hat, info)
-    """
-    p = X.shape[1]
-    lamI = ridge_lambda * np.eye(p)
-    XtX = X.T @ X + lamI
-    a7_hat = np.linalg.solve(XtX, X.T @ y)
-    cond = np.linalg.cond(XtX)
-    rank = np.linalg.matrix_rank(X)
-    info = dict(cond=cond, rank=rank)
-    return a7_hat, info
-
-def plot_fit(y, y_pred, out_path, title):
-    plt.figure()
-    plt.plot(y, label="measured τ7")
-    plt.plot(y_pred, label="predicted τ7")
-    plt.xlabel("time step")
-    plt.ylabel("torque (Nm)")
-    plt.legend()
-    plt.title(title)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
-
-# =========================
-# Main pipeline (Dual-run)
-# =========================
-
-def main():
-    """
-    双仿真流程：
-      Run A：估计 link7 的 10 个参数 a7_hat
-      Run B：使用 A 的 a7_hat 在新数据上做预测与评估（严格符合“重复仿真再评估”的要求）
-    并计算：R²、Adjusted R²、F-stat、95%CI；保存CSV与图
-    """
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    conf_file_name = "pandaconfig.json"
-
-    out_dir = makedirs(os.path.join(cur_dir, f"lab1_out_{now_tag()}"))
-
-    # --- 轨迹设计：A/B 两次仿真使用不同频率与相位，提升可辨识性且满足“重复仿真评估” ---
-    # 建议频率互不相等、避免共振；幅值适中
-    amp = np.array([np.pi/4, np.pi/6, np.pi/5, np.pi/5, np.pi/6, np.pi/5, np.pi/6])
-    freq_A = np.array([0.37, 0.53, 0.61, 0.43, 0.71, 0.47, 0.59])
-    freq_B = np.array([0.41, 0.57, 0.63, 0.45, 0.73, 0.49, 0.55])  # 与A不同
-    duration = 12.0
-    kp, kd = 1000.0, 100.0
-
-    print("\n=== Run A: estimation ===")
-    Y_A, U_A, n = run_sim(conf_file_name, cur_dir, amp, freq_A, duration=duration, kp=kp, kd=kd, seed=123)
-    X_A, y_A = stack_last_joint(Y_A, U_A)   # link7 的 (T,10) 与 (T,)
-    print(f"[A] X_A: {X_A.shape}, y_A: {y_A.shape}")
-
-    a7_hat, infoA = estimate_a7(X_A, y_A, ridge_lambda=1e-8)
-    yA_pred = X_A @ a7_hat
-    metA = compute_metrics(y_A, yA_pred, p=X_A.shape[1])
-    ciA_lo, ciA_hi, stderrA, sigma2A = ci_from_ols(X_A, y_A, a7_hat, ridge_lambda=1e-8)
-
-    print("\n[A] link7 parameters (10):")
-    print("a7_hat:", a7_hat)
-    print(f"[A] R^2={metA['r2']:.4f}, R^2_adj={metA['r2_adj']:.4f}, F={metA['F']:.2f}  (df={metA['dof_num']},{metA['dof_den']})")
-    print(f"[A] cond(X^T X)≈{infoA['cond']:.2e}, rank(X)={infoA['rank']}")
-    print("[A] 95% CI low :", ciA_lo)
-    print("[A] 95% CI high:", ciA_hi)
-    plot_fit(y_A, yA_pred, os.path.join(out_dir, "A_tau7_fit.png"), "Run A (train) τ7 fit")
-
-    # --- 可选：从 URDF 读取“真值”对比（若失败则跳过） ---
+    # --- 读取 URDF 真值 ---
     urdf_path = os.path.join(cur_dir, "models", "panda_description", "panda.urdf")
-    a7_true = parse_urdf_link7_true_params(urdf_path, link_name_candidates=("panda_link7","link7"))
-    if a7_true is not None:
-        param_err = a7_hat - a7_true
-        print("\n[A] compare to URDF link7 (approx packed as [m,mcx,mcy,mcz,Ixx,Ixy,Ixz,Iyy,Iyz,Izz])")
-        print("a7_true:", a7_true)
-        print("a7_hat - a7_true:", param_err)
-        np.savetxt(os.path.join(out_dir, "A_a7_true.csv"), a7_true, delimiter=",")
-        np.savetxt(os.path.join(out_dir, "A_a7_param_error.csv"), param_err, delimiter=",")
+    link_names = [f"panda_link{i}" for i in range(1,8)]
+    true_params_all = {i: extract_link10_from_urdf(urdf_path, link_names[i-1]) for i in range(1,8)}
+    a_true_all = build_full_param_vector(n, true_params_all)
 
-    # 保存 A 结果
-    np.savetxt(os.path.join(out_dir, "A_X.csv"), X_A, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "A_y.csv"), y_A, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "A_a7_hat.csv"), a7_hat, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "A_a7_ci_low.csv"), ciA_lo, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "A_a7_ci_high.csv"), ciA_hi, delimiter=",")
-    with open(os.path.join(out_dir, "A_metrics.txt"), "w") as f:
-        f.write(f"R2={metA['r2']:.6f}\nR2_adj={metA['r2_adj']:.6f}\nF={metA['F']:.6f}\n")
-        f.write(f"dof=({metA['dof_num']},{metA['dof_den']})\n")
-        f.write(f"cond={infoA['cond']:.6e}\nrank={infoA['rank']}\n")
+    # ============================================================
+    # ===================  PART 2: 全部参数  ======================
+    # ============================================================
+    print("\n" + "="*72)
+    print("PART 2: Estimating ALL links (1..7) parameters simultaneously")
+    print("="*72)
 
-    print("\n=== Run B: validation on new trajectory ===")
-    Y_B, U_B, _ = run_sim(conf_file_name, cur_dir, amp, freq_B, duration=duration, kp=kp, kd=kd, seed=999)
-    X_B, y_B = stack_last_joint(Y_B, U_B)
-    print(f"[B] X_B: {X_B.shape}, y_B: {y_B.shape}")
+    XtX_all = Y_stack.T @ Y_stack
+    condY = np.linalg.cond(XtX_all)
+    lam_all = 1e-6 if condY < 1e6 else 1e-4
+    a_hat_all = np.linalg.solve(XtX_all + lam_all*np.eye(XtX_all.shape[0]), Y_stack.T @ tau_stack)
 
-    yB_pred = X_B @ a7_hat
-    metB = compute_metrics(y_B, yB_pred, p=X_B.shape[1])
-    ciB_lo, ciB_hi, stderrB, sigma2B = ci_from_ols(X_B, y_B, a7_hat, ridge_lambda=1e-8)
+    print(f"[diag] cond(Y^T Y) = {condY:.3e}   ridge λ = {lam_all}")
 
-    print("\n[B] validation metrics (using a7_hat from A):")
-    print(f"[B] R^2={metB['r2']:.4f}, R^2_adj={metB['r2_adj']:.4f}, F={metB['F']:.2f}  (df={metB['dof_num']},{metB['dof_den']})")
-    print("[B] 95% CI (based on B residuals):")
-    print(" low :", ciB_lo)
-    print(" high:", ciB_hi)
-    plot_fit(y_B, yB_pred, os.path.join(out_dir, "B_tau7_fit.png"), "Run B (val) τ7 fit")
+    # 误差（全部70维）
+    abs_err_all = np.abs(a_hat_all - a_true_all)
+    rel_err_all = np.where(a_true_all != 0, 100*np.abs((a_hat_all - a_true_all)/a_true_all), np.nan)
 
-    # 保存 B 结果
-    np.savetxt(os.path.join(out_dir, "B_X.csv"), X_B, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "B_y.csv"), y_B, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "B_y_pred.csv"), yB_pred, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "B_a7_ci_low.csv"), ciB_lo, delimiter=",")
-    np.savetxt(os.path.join(out_dir, "B_a7_ci_high.csv"), ciB_hi, delimiter=",")
-    with open(os.path.join(out_dir, "B_metrics.txt"), "w") as f:
-        f.write(f"R2={metB['r2']:.6f}\nR2_adj={metB['r2_adj']:.6f}\nF={metB['F']:.6f}\n")
-        f.write(f"dof=({metB['dof_num']},{metB['dof_den']})\n")
+    print("\nPer-link error summary (|abs| and rel % by link, grouped in chunks of 10):")
+    per_link_mean_rel = []
+    for i in range(1, 8):
+        s = 10*(i-1); e = 10*i
+        abs_err_i = abs_err_all[s:e]
+        rel_err_i = rel_err_all[s:e]
+        per_link_mean_rel.append(np.nanmean(rel_err_i))
+        print(f"\nLink {i}:")
+        print("  abs error: ", np.round(abs_err_i, 6))
+        print("  rel  %   : ", np.round(rel_err_i, 2))
+        print(f"  mean |rel|%: {np.nanmean(rel_err_i):.2f}   max |rel|%: {np.nanmax(rel_err_i):.2f}")
 
-    print(f"\n[OK] outputs saved to: {out_dir}")
-    print("  - A_tau7_fit.png / B_tau7_fit.png 图")
-    print("  - A/B_X.csv, A/B_y.csv, A_a7_hat.csv, A/B_metrics.txt 等")
-    print("  - 若解析到 URDF 真值，则有 A_a7_true.csv 与 A_a7_param_error.csv (近似)")
+    # Torque 预测与指标（全部参数）
+    tau_pred_all = Y_stack @ a_hat_all
+    rmse_all = float(np.sqrt(np.mean((tau_pred_all - tau_stack)**2)))
+    mets_all = regression_metrics(tau_stack, tau_pred_all, p=Y_stack.shape[1], has_intercept=False)
+    print(f"\n[Part 2] Torque RMSE = {rmse_all:.6f}")
+    print(f"[Part 2] R2 = {mets_all['R2']:.6f}  R2_adj = {mets_all['R2_adj']:.6f}  F = {mets_all['F']:.3f}")
+
+    # 图：Part2 torque 实测 vs 预测
+    tau_true_mat = np.vstack(tau_mes_all)                         # (T, 7)
+    tau_pred_full_mat = np.vstack([Yt @ a_hat_all for Yt in regressor_all])
+    t_axis = np.array(times[:tau_true_mat.shape[0]])
+
+    figp2, axp2 = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
+    for j in range(7):
+        ax = axp2[j]
+        ax.plot(t_axis, tau_true_mat[:, j], label=f"τ{j+1} meas")
+        ax.plot(t_axis, tau_pred_full_mat[:, j], "--", label=f"τ{j+1} pred (full)")
+        ax.set_ylabel(f"J{j+1}")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend(loc="upper right", ncol=2, fontsize=8)
+    axp2[-1].set_xlabel("Time [s]")
+    figp2.suptitle("Part 2: Torque prediction (all 70 params) vs measured")
+    plt.tight_layout()
+    plt.savefig("part2_torque.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part2_torque.png"))
+
+    # 图：Part2 每个 link 的平均相对误差
+    figp2b, axp2b = plt.subplots(figsize=(8,4))
+    axp2b.bar(np.arange(1,8), per_link_mean_rel)
+    axp2b.set_xlabel("Link index")
+    axp2b.set_ylabel("Mean relative error (%)")
+    axp2b.set_title("Part 2: Mean relative parameter error per link")
+    axp2b.set_xticks(np.arange(1,8))
+    axp2b.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("part2_link_mean_rel_errors.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part2_link_mean_rel_errors.png"))
+
+    # ============================================================
+    # ===================  PART 1: 仅 Link 7  =====================
+    # ============================================================
+    print("\n" + "="*72)
+    print("PART 1: Estimating ONLY link 7 (links 1..6 known)")
+    print("="*72)
+
+    # 构造已知参数向量（1..6 从URDF，7 置0）
+    per_link_params_known = {i: true_params_all[i] for i in range(1, 7)}
+    a_known_full = build_full_param_vector(n, per_link_params_known)
+
+    s7, e7 = 10*(7-1), 10*(7-1)+10
+    r = tau_stack - (Y_stack @ a_known_full)     # 去掉 1..6 贡献
+    X7 = Y_stack[:, s7:e7]                       # 只保留 link7 的10列
+
+    XtX7 = X7.T @ X7
+    cond7 = np.linalg.cond(XtX7)
+    lam7 = 1e-6 if cond7 < 1e6 else 1e-4
+    a7_hat = np.linalg.solve(XtX7 + lam7*np.eye(10), X7.T @ r)
+
+    a7_true = true_params_all[7]
+    abs_err7 = np.abs(a7_hat - a7_true)
+    rel_err7 = np.where(a7_true != 0, 100*np.abs((a7_hat - a7_true)/a7_true), np.nan)
+
+    print(f"[diag] cond(X7^T X7) = {cond7:.3e}   ridge λ = {lam7}")
+    print("\n[Part1] link7 params:")
+    print("  a7_true:", np.round(a7_true, 6))
+    print("  a7_hat :", np.round(a7_hat, 6))
+    print("  abs err:", np.round(abs_err7, 6))
+    print("  mean |rel|% = {:.2f}   max |rel|% = {:.2f}".format(np.nanmean(rel_err7), np.nanmax(rel_err7)))
+
+    # 用 Part1 的 a_full_hat 做力矩预测与指标
+    a_full_hat = a_known_full.copy()
+    a_full_hat[s7:e7] = a7_hat
+    tau_hat_part1 = Y_stack @ a_full_hat
+    rmse_part1 = float(np.sqrt(np.mean((tau_hat_part1 - tau_stack)**2)))
+    mets1 = regression_metrics(tau_stack, tau_hat_part1, p=10, has_intercept=False)
+    print(f"\n[Part 1] Torque RMSE = {rmse_part1:.6f}")
+    print(f"[Part 1] R2 = {mets1['R2']:.6f}  R2_adj = {mets1['R2_adj']:.6f}  F = {mets1['F']:.3f}")
+
+    # 图：Link7 真值 vs 估计
+    labels = [f"p{i+1}" for i in range(10)]
+    x = np.arange(10); width = 0.35
+    fig1, ax1 = plt.subplots(figsize=(10,4))
+    ax1.bar(x - width/2, a7_true, width, label="True")
+    ax1.bar(x + width/2, a7_hat,  width, label="Estimated")
+    ax1.set_xticks(x); ax1.set_xticklabels(labels)
+    ax1.set_title("Link 7 Parameters: True vs Estimated")
+    ax1.grid(True, alpha=0.3); ax1.legend()
+    plt.tight_layout()
+    plt.savefig("link7_param_compare.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("link7_param_compare.png"))
+
+    # 图：Link7 绝对误差
+    fig2, ax2 = plt.subplots(figsize=(10,3.2))
+    ax2.bar(x, abs_err7)
+    ax2.set_xticks(x); ax2.set_xticklabels(labels)
+    ax2.set_title("Link 7 Absolute Parameter Errors")
+    ax2.set_ylabel("|Error|"); ax2.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("link7_param_errors.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("link7_param_errors.png"))
+
+    # 图：Part1 torque 实测/预测/误差
+    tau_mat  = np.vstack(tau_mes_all)                         # (T, 7)
+    uhat_mat = np.vstack([Yt @ a_full_hat for Yt in regressor_all])
+    err_mat  = uhat_mat - tau_mat
+    t_axis1 = np.array(times[:tau_mat.shape[0]])
+
+    fig3, axes = plt.subplots(7, 1, figsize=(10, 14), sharex=True)
+    for j in range(7):
+        ax = axes[j]
+        ax.plot(t_axis1, tau_mat[:, j], label=f"τ{j+1} meas")
+        ax.plot(t_axis1, uhat_mat[:, j], linestyle="--", label=f"τ{j+1} pred")
+        ax.plot(t_axis1, err_mat[:, j], linestyle=":", label=f"error τ{j+1}")
+        ax.set_ylabel(f"J{j+1}")
+        ax.grid(True, alpha=0.3)
+        if j == 0:
+            ax.legend(loc="upper right", ncol=3, fontsize=8)
+    axes[-1].set_xlabel("Time [s]")
+    fig3.suptitle("Part 1: Torque prediction & error (Link 7 only)")
+    plt.tight_layout()
+    plt.savefig("part1_torque.png", dpi=150)
+    print("[OK] saved ->", os.path.abspath("part1_torque.png"))
+
+    # --- 摘要 ---
+    print("\n===== SUMMARY =====")
+    print(f"Part 1: Link7 mean |rel|% = {np.nanmean(rel_err7):.2f}    RMSE = {rmse_part1:.6f}")
+    print(f"Part 2: All-links mean |rel|% (avg over links) = {np.nanmean(per_link_mean_rel):.2f}    RMSE = {rmse_all:.6f}")
+    print("Saved figures: link7_param_compare.png, link7_param_errors.png, part1_torque.png, part2_torque.png, part2_link_mean_rel_errors.png")
 
 if __name__ == '__main__':
     main()
